@@ -68,9 +68,10 @@ def load_multiple_projection_files(file_pattern="./Phantom Dataset/Al phantom/1.
         traceback.print_exc()
         return None
 
-def reconstruct_3d_parallel_beam(projections, angles=None, use_gpu=True):
+def reconstruct_3d_parallel_beam(projections, angles=None):
     """
-    Reconstruct 3D volume from projection data with proper dimension handling
+    Reconstruct 3D volume from projection data with proper dimension handling.
+    CPU-only: no GPU code.
     """
     height, num_angles, detector_width = projections.shape
     
@@ -79,99 +80,72 @@ def reconstruct_3d_parallel_beam(projections, angles=None, use_gpu=True):
     
     print(f"\nStarting 3D reconstruction with {num_angles} angles...")
     print(f"Volume dimensions: {detector_width}x{detector_width}x{height}")
+    print(f"Projection data shape: {projections.shape}")
     
-    # Create geometries
-    vol_geom = astra.create_vol_geom(detector_width, detector_width, height)
-    
-    try:
-        if use_gpu:
-            print("Attempting GPU-accelerated reconstruction...")
-            # For GPU, we need to use 'parallel3d' geometry
-            proj_geom = astra.create_proj_geom('parallel3d', 1.0, 1.0, 
-                                             height, detector_width, angles)
-            
-            # Create data objects
-            proj_id = astra.data3d.create('-proj3d', proj_geom, projections)
-            rec_id = astra.data3d.create('-vol', vol_geom, data=0)
-            
-            # Create algorithm
-            cfg = astra.astra_dict('FBP3D_CUDA')
-            cfg['ReconstructionDataId'] = rec_id
-            cfg['ProjectionDataId'] = proj_id
-            cfg['FilterType'] = 'Ram-Lak'
-            
-            alg_id = astra.algorithm.create(cfg)
-            astra.algorithm.run(alg_id)
-            reconstruction = astra.data3d.get(rec_id)
-            
-            # Clean up
-            astra.algorithm.delete(alg_id)
-            astra.data3d.delete(rec_id)
-            astra.data3d.delete(proj_id)
-            
-            return reconstruction
-    except Exception as e:
-        print(f"GPU reconstruction failed: {e}")
-        print("Falling back to slice-by-slice CPU reconstruction...")
-    
-    # If GPU failed or not requested, use CPU slice-by-slice
+    # Use CPU slice-by-slice reconstruction
     return reconstruct_slice_by_slice(projections, angles)
 
 def reconstruct_slice_by_slice(projections, angles):
-    """Slice-by-slice reconstruction with proper dimension handling"""
+    """Slice-by-slice reconstruction with CPU-only algorithms and correct projector."""
     height, num_angles, detector_width = projections.shape
     
     reconstruction = np.zeros((height, detector_width, detector_width), dtype=np.float32)
     
-    # Create 2D geometry - note the order of dimensions is important
+    # Create 2D geometry
     vol_geom = astra.create_vol_geom(detector_width, detector_width)
     proj_geom = astra.create_proj_geom('parallel', 1.0, detector_width, angles)
     
+    # Create projector - CPU only
+    projector_id = astra.create_projector('line', proj_geom, vol_geom)
+    
     print(f"Reconstructing {height} slices:")
+    print(f"Expected sinogram shape per slice: ({num_angles}, {detector_width})")
+    print(f"Created projector with ID: {projector_id}")
     
     for slice_idx in range(height):
         if slice_idx % 10 == 0 or slice_idx == height-1:
             print(f"\rProgress: {slice_idx+1}/{height} slices", end="", flush=True)
         
-        # Get sinogram for this slice and ensure correct dimensions
-        sinogram = projections[slice_idx, :, :].T  # Transpose to match ASTRA's expected format
+        sinogram = projections[slice_idx, :, :]  # Shape: (num_angles, detector_width)
         
-        # Ensure sinogram dimensions match geometry
         if sinogram.shape != (num_angles, detector_width):
-            print(f"\nError: Sinogram dimensions {sinogram.shape} do not match geometry ({num_angles}, {detector_width})")
+            print(f"\nError: Sinogram dimensions {sinogram.shape} do not match expected ({num_angles}, {detector_width})")
             continue
         
-        # Create data objects
         proj_id = astra.data2d.create('-sino', proj_geom, sinogram)
         rec_id = astra.data2d.create('-vol', vol_geom)
         
-        # Configure reconstruction
-        cfg = astra.astra_dict('FBP')
-        cfg['ReconstructionDataId'] = rec_id
-        cfg['ProjectionDataId'] = proj_id
-        cfg['FilterType'] = 'Ram-Lak'
+        # CPU-only: use FBP with projector, fallback to SIRT if needed
+        try:
+            cfg = astra.astra_dict('FBP')
+            cfg['ReconstructionDataId'] = rec_id
+            cfg['ProjectionDataId'] = proj_id
+            cfg['ProjectorId'] = projector_id
+            cfg['FilterType'] = 'Ram-Lak'
+        except:
+            cfg = astra.astra_dict('SIRT')
+            cfg['ReconstructionDataId'] = rec_id
+            cfg['ProjectionDataId'] = proj_id
+            cfg['ProjectorId'] = projector_id
         
         alg_id = astra.algorithm.create(cfg)
         astra.algorithm.run(alg_id)
         
         reconstruction[slice_idx] = astra.data2d.get(rec_id)
         
-        # Clean up
         astra.algorithm.delete(alg_id)
         astra.data2d.delete(rec_id)
         astra.data2d.delete(proj_id)
     
+    astra.projector.delete(projector_id)
     print()  # New line after progress
     return reconstruction
 
 def preprocess_projection_data(projections):
-    """Enhanced preprocessing with better normalization and filtering"""
+    """Enhanced preprocessing with better normalization and filtering."""
     print("\nPreprocessing projection data...")
     
-    # Convert to float32
     projections = projections.astype(np.float32)
-    
-    # Handle different data ranges
     data_max = projections.max()
     if data_max > 60000:  # Likely 16-bit data
         print("Normalizing 16-bit data...")
@@ -179,11 +153,6 @@ def preprocess_projection_data(projections):
     elif data_max > 1.0:
         print("Normalizing data to [0,1] range...")
         projections = projections / data_max
-    
-    # Apply negative log transform if needed (for transmission data)
-    # Uncomment if working with transmission measurements
-    # print("Applying negative log transform...")
-    # projections = -np.log(projections + 1e-10)
     
     # Apply mild Gaussian filtering to reduce noise
     print("Applying mild noise reduction...")
@@ -199,23 +168,21 @@ def preprocess_projection_data(projections):
     return projections
 
 def visualize_3d_results(projections, reconstruction):
-    """Enhanced visualization with more informative plots"""
+    """Enhanced visualization with more informative plots."""
     height, num_angles, detector_width = projections.shape
     
-    # Normalize reconstruction for visualization
     reconstruction = (reconstruction - reconstruction.min()) / (reconstruction.max() - reconstruction.min())
     
-    # Create figure
     plt.figure(figsize=(18, 12))
     plt.suptitle("3D Reconstruction Results", fontsize=16, y=1.02)
     
     # Sample sinogram
     plt.subplot(2, 3, 1)
     mid_slice = height // 2
-    plt.imshow(projections[mid_slice, :, :].T, cmap='gray', aspect='auto')
+    plt.imshow(projections[mid_slice, :, :], cmap='gray', aspect='auto')
     plt.title(f'Sample Sinogram (Slice {mid_slice})')
-    plt.xlabel('Projection Angle Index')
-    plt.ylabel('Detector Position')
+    plt.xlabel('Detector Position')
+    plt.ylabel('Projection Angle Index')
     plt.colorbar(label='Intensity')
     
     # Reconstructed slices
@@ -251,77 +218,50 @@ def visualize_3d_results(projections, reconstruction):
     plt.show()
 
 def save_reconstruction(reconstruction, output_dir='reconstruction_output'):
-    """Enhanced saving with metadata and multiple formats"""
+    """Enhanced saving with metadata and multiple formats."""
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Save as numpy array
     np.save(os.path.join(output_dir, 'reconstruction_3d.npy'), reconstruction)
-    
-    # Save metadata
     with open(os.path.join(output_dir, 'metadata.txt'), 'w') as f:
         f.write(f"Reconstruction dimensions: {reconstruction.shape}\n")
         f.write(f"Data range: min={reconstruction.min():.4f}, max={reconstruction.max():.4f}\n")
         f.write(f"Data type: {reconstruction.dtype}\n")
-    
-    # Save slices as images
     slice_dir = os.path.join(output_dir, 'slices')
     os.makedirs(slice_dir, exist_ok=True)
-    
     print(f"\nSaving slices to {slice_dir}:")
     for i in range(reconstruction.shape[0]):
         if i % 10 == 0 or i == reconstruction.shape[0]-1:
             print(f"\rProgress: {i+1}/{reconstruction.shape[0]} slices", end="", flush=True)
-        
         slice_img = reconstruction[i, :, :]
         slice_img = (255 * (slice_img - slice_img.min()) / 
                    (slice_img.max() - slice_img.min() + 1e-10)).astype(np.uint8)
         plt.imsave(os.path.join(slice_dir, f'slice_{i:03d}.png'), slice_img, cmap='gray')
-    
     print("\nSaving complete.")
 
 def main():
-    """Enhanced main workflow with better parameter handling"""
+    """Enhanced main workflow with better parameter handling."""
     print("=" * 60)
     print("Enhanced 3D CT Reconstruction using ASTRA Toolbox")
     print("=" * 60)
-    
-    # Parameters - adjust these as needed
     params = {
         'file_pattern': "./Phantom Dataset/Al phantom/*.txt",
-        'expected_projections': 60,  # Adjust based on your data
-        'use_gpu': True,
+        'expected_projections': 360,  # Adjust based on your data
         'output_dir': 'reconstruction_results'
     }
-    
     try:
-        # Load projections
         projections = load_multiple_projection_files(
             file_pattern=params['file_pattern'],
             num_files=params['expected_projections'])
-        
         if projections is None:
             return None
-        
-        # Preprocess
         projections = preprocess_projection_data(projections)
-        
-        # Reconstruct
         reconstruction = reconstruct_3d_parallel_beam(
-            projections,
-            use_gpu=params['use_gpu'])
-        
-        # Visualize
+            projections)
         visualize_3d_results(projections, reconstruction)
-        
-        # Save results
         save_reconstruction(reconstruction, params['output_dir'])
-        
         print("\nReconstruction completed successfully!")
         print(f"Final volume shape: {reconstruction.shape}")
         print(f"Data range: {reconstruction.min():.4f} to {reconstruction.max():.4f}")
-        
         return reconstruction
-        
     except Exception as e:
         print(f"\nError during reconstruction: {e}")
         import traceback
@@ -329,7 +269,6 @@ def main():
         return None
 
 if __name__ == "__main__":
-    # Run reconstruction with timing
     start_time = time.time()
     volume = main()
     duration = time.time() - start_time
