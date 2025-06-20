@@ -6,11 +6,16 @@ import glob
 from pathlib import Path
 from scipy import ndimage
 import time
+import re
 
 def load_multiple_projection_files(file_pattern="./Phantom Dataset/Al phantom/1.txt", num_files=360):
     try:
         # Find all matching files
-        file_list = sorted(glob.glob(file_pattern))
+        def extract_number(filename):
+            match = re.search(r'(\d+)', os.path.basename(filename))
+            return int(match.group(1)) if match else -1
+
+        file_list = sorted(glob.glob(file_pattern), key=extract_number)
         
         if len(file_list) == 0:
             raise FileNotFoundError(f"No files found matching pattern: {file_pattern}")
@@ -142,7 +147,7 @@ def reconstruct_slice_by_slice(projections, angles):
     return reconstruction
 
 def preprocess_projection_data(projections):
-    """Enhanced preprocessing with better normalization and filtering."""
+    """Preprocess projection data with global normalization and mild filtering."""
     print("\nPreprocessing projection data...")
     
     projections = projections.astype(np.float32)
@@ -159,13 +164,11 @@ def preprocess_projection_data(projections):
     for i in range(projections.shape[0]):
         projections[i] = ndimage.gaussian_filter(projections[i], sigma=0.5)
     
-    # Normalize each projection
-    for i in range(projections.shape[1]):
-        proj = projections[:, i, :]
-        proj = (proj - proj.min()) / (proj.max() - proj.min())
-        projections[:, i, :] = proj
+    # Global normalization
+    projections = (projections - projections.min()) / (projections.max() - projections.min())
     
     return projections
+
 
 def visualize_3d_results(projections, reconstruction):
     """Enhanced visualization with more informative plots."""
