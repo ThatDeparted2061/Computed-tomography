@@ -76,13 +76,12 @@ def load_multiple_projection_files(file_pattern="./Phantom Dataset/Al phantom/1.
 
 def straighten_sinogram_custom(projections, air_value=65535):
     """
-    Custom sinogram straightening algorithm as requested:
-    - Find where values go below 65535 (start of width)
-    - Find where they don't come back to 65535 (end of width)
-    - Calculate center as (start+end)/2
-    - Align all centers from different angles
+    Enhanced sinogram straightening algorithm:
+    - Uses weighted center-of-mass for more robust center detection
+    - Applies smoothing to center positions across angles
+    - Uses sub-pixel shifting for better alignment
     """
-    print("Applying custom sinogram straightening algorithm...")
+    print("Applying enhanced sinogram straightening algorithm...")
     
     height, num_angles, detector_width = projections.shape
     aligned_projections = np.zeros_like(projections)
@@ -99,26 +98,24 @@ def straighten_sinogram_custom(projections, air_value=65535):
         for slice_idx in range(height):
             projection = projections[slice_idx, angle, :]
             
-            # Find start: first point where value goes below air_value (65535)
-            below_air = projection < air_value
+            # Calculate weights as inverse of intensity (more weight to darker pixels)
+            weights = air_value - projection
+            weights = np.maximum(weights, 0)  # Ensure non-negative
             
-            if np.any(below_air):
-                # Find the start of attenuation (first value below air_value)
-                start_indices = np.where(below_air)[0]
-                start = start_indices[0] if len(start_indices) > 0 else 0
-                
-                # Find the end of attenuation (last value below air_value)
-                end = start_indices[-1] if len(start_indices) > 0 else detector_width - 1
-                
-                # Calculate center as (start + end) / 2 as requested
-                center = (start + end) / 2.0
+            # Calculate weighted center of mass
+            if np.sum(weights) > 0:
+                indices = np.arange(detector_width)
+                center = np.sum(indices * weights) / np.sum(weights)
             else:
-                # If no attenuation found, use detector center
                 center = detector_width / 2.0
                 
             centers[slice_idx, angle] = center
     
-    print("\nCalculating reference center...")
+    print("\nApplying smoothing to center positions...")
+    
+    # Apply smoothing to center positions across angles
+    for slice_idx in range(height):
+        centers[slice_idx, :] = ndimage.gaussian_filter1d(centers[slice_idx, :], sigma=3)
     
     # Calculate the reference center (median of all centers for stability)
     reference_center = np.median(centers)
@@ -128,9 +125,9 @@ def straighten_sinogram_custom(projections, air_value=65535):
     print(f"Center range: {centers.min():.2f} to {centers.max():.2f} pixels")
     print(f"Center std deviation: {centers.std():.2f} pixels")
     
-    print("Aligning projections to reference center...")
+    print("Aligning projections to reference center with sub-pixel precision...")
     
-    # Apply alignment shifts
+    # Apply alignment shifts with sub-pixel precision
     for angle in range(num_angles):
         if angle % 20 == 0 or angle == num_angles-1:
             print(f"\rAligning angle {angle+1}/{num_angles}", end="", flush=True)
@@ -139,33 +136,20 @@ def straighten_sinogram_custom(projections, air_value=65535):
             projection = projections[slice_idx, angle, :]
             current_center = centers[slice_idx, angle]
             
-            # Calculate shift needed to align to reference center
-            shift = int(round(reference_center - current_center))
+            # Calculate sub-pixel shift needed
+            shift = reference_center - current_center
             
-            # Apply the shift
-            if shift > 0:
-                # Shift right: pad left with air value
-                if shift < detector_width:
-                    aligned_projections[slice_idx, angle, shift:] = projection[:-shift]
-                    aligned_projections[slice_idx, angle, :shift] = air_value
-                else:
-                    # Shift too large, fill with air value
-                    aligned_projections[slice_idx, angle, :] = air_value
-                    
-            elif shift < 0:
-                # Shift left: pad right with air value
-                shift = abs(shift)
-                if shift < detector_width:
-                    aligned_projections[slice_idx, angle, :-shift] = projection[shift:]
-                    aligned_projections[slice_idx, angle, -shift:] = air_value
-                else:
-                    # Shift too large, fill with air value
-                    aligned_projections[slice_idx, angle, :] = air_value
-            else:
-                # No shift needed
-                aligned_projections[slice_idx, angle, :] = projection
+            # Apply the shift with sub-pixel precision
+            # Note: For 1D array, shift should be a single value, not a tuple
+            aligned_projections[slice_idx, angle, :] = ndimage.shift(
+                projection, 
+                shift=shift,  # Single value for 1D array
+                mode='constant',
+                cval=air_value,
+                order=1  # Linear interpolation for sub-pixel shifts
+            )
     
-    print("\nCustom sinogram straightening complete!")
+    print("\nEnhanced sinogram straightening complete!")
     
     # Show alignment improvement
     center_std_before = centers.std()
@@ -175,12 +159,12 @@ def straighten_sinogram_custom(projections, air_value=65535):
     for angle in range(num_angles):
         for slice_idx in range(height):
             projection = aligned_projections[slice_idx, angle, :]
-            below_air = projection < air_value
-            if np.any(below_air):
-                start_indices = np.where(below_air)[0]
-                start = start_indices[0]
-                end = start_indices[-1]
-                centers_after[slice_idx, angle] = (start + end) / 2.0
+            weights = air_value - projection
+            weights = np.maximum(weights, 0)
+            
+            if np.sum(weights) > 0:
+                indices = np.arange(detector_width)
+                centers_after[slice_idx, angle] = np.sum(indices * weights) / np.sum(weights)
             else:
                 centers_after[slice_idx, angle] = detector_width / 2.0
     
